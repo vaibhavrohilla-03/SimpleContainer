@@ -44,6 +44,9 @@ func run(memLimit string, cpuQuota string, containerArgs []string) {
 
 	printpid()
 
+	bridgeName := "brg0"
+	subnet := "10.10.10.0/24"
+
 	// osName := os.Args[1]
 	args := append([]string{"fork"}, containerArgs...)
 
@@ -53,21 +56,40 @@ func run(memLimit string, cpuQuota string, containerArgs []string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:  syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWPID | syscall.CLONE_NEWUSER,
+		Cloneflags:  syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWPID | syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
 		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
 		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
 	}
 
+	reader, writer, err := os.Pipe()
+	must(err)
+	cmd.ExtraFiles = []*os.File{writer}
+
 	setupCgroups()
 	defer cleanupCgroups()
-
 	setResourceLimits(memLimit, cpuQuota)
 
 	must(cmd.Start())
+	writer.Close()
+
 	fmt.Printf("started process with PID: %d\n", cmd.Process.Pid)
 
-	addProcessToCgroup(cmd.Process.Pid)
+	buf := make([]byte, 1)
+	_, err = reader.Read(buf)
+	if err != nil {
+		fmt.Printf("Error waiting for child signal: %v\n", err)
+		return
+	}
 
+	netsetgoPath := "/usr/local/bin/netsetgo"
+	pid := fmt.Sprintf("%d", cmd.Process.Pid)
+	netsetgoCmd := exec.Command(netsetgoPath, "-pid", pid)
+	must(netsetgoCmd.Run())
+
+	must(setupNAT(bridgeName, subnet))
+	defer cleanupNAT(bridgeName, subnet)
+
+	addProcessToCgroup(cmd.Process.Pid)
 	must(cmd.Wait())
 }
 
@@ -75,8 +97,15 @@ func fork() {
 
 	printpid()
 	fmt.Println(os.Args)
+
+	writer := os.NewFile(uintptr(3), "pipe")
+
 	osName := os.Args[2]
 	command := os.Args[3]
+
+	_, err := writer.Write([]byte("1"))
+	must(err)
+	writer.Close()
 
 	newRoot := filepath.Join("/home/vagrant/rootfs", osName)
 
@@ -101,18 +130,22 @@ func fork() {
 	must(syscall.Unmount(putOld, syscall.MNT_DETACH))
 	must(syscall.Rmdir(putOld))
 
+	must(setupDNS(newRoot))
+	must(waitforNetwork())
+
 	cmd := exec.Command(command, os.Args[4:]...)
 
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	must(err)
 
 	must(syscall.Unmount("proc", syscall.MNT_DETACH))
 	must(syscall.Unmount("dev", syscall.MNT_DETACH))
 	must(syscall.Unmount("tmp", syscall.MNT_DETACH))
+
 }
 
 func must(err error) {
